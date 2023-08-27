@@ -1,9 +1,11 @@
+
 # USAGE
 # python pi_face_recognition.py --cascade haarcascade_frontalface_default.xml --encodings encodings.pickle
 
 # import the necessary packages
 from imutils.video import FPS, VideoStream
 from datetime import datetime
+from imutils import adjust_brightness_contrast
 import face_recognition
 import argparse
 import imutils
@@ -15,6 +17,8 @@ import sys
 import signal
 import os
 import numpy as np
+import subprocess
+from phue import Bridge
 
 # To properly pass JSON.stringify()ed bool command line parameters, e.g. "--extendDataset"
 # See: https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
@@ -36,8 +40,28 @@ def signalHandler(signal, frame):
 	global closeSafe
 	closeSafe = True
 
+def logtime(message):
+	pass
+	#printjson("status","- "+time.asctime()+": "+message)
+
+def checkHDMI():
+	#global subprocess
+	#test0=subprocess.check_output('./modules/MMM-Face-Reco-DNN/tools/checkHDMI.sh')
+	#test=(len(test0)>0)
+	global hueBridge,hueBridgeActivated, HDMIStatus
+	HDMIStatus = False
+	try:
+		if not hueBridgeActivated:
+			hueBridge=Bridge('192.168.88.10')
+			hueBridgeActivated = True
+		HDMIStatus=hueBridge.get_light('On/Off plug smart mirror','on')
+	except:
+		pass
+	return HDMIStatus
+    
 signal.signal(signal.SIGINT, signalHandler)
 closeSafe = False
+hueBridgeActivated=False
 
 # construct the argument parser and parse the arguments
 ap = argparse.ArgumentParser()
@@ -65,6 +89,14 @@ ap.add_argument("-ds", "--dataset", required=False, default="../dataset/",
 	help="path to input directory of faces + images")
 ap.add_argument("-t", "--tolerance", type=float, required=False, default=0.6,
 	help="How much distance between faces to consider it a match. Lower is more strict.")
+ap.add_argument("-fw", "--frameWidth", type=int, required=False, default=608,
+	help="Width of grabbed frames.")
+ap.add_argument("-fh", "--frameHeight", type=int, required=False, default=800,
+	help="Height of grabbed frames.")
+ap.add_argument("-fmt", "--frameMarginTop", type=int, required=False, default=0,
+	help="How many lines are cropped from the top of the frame before processing.")
+ap.add_argument("-fmb", "--frameMarginBottom", type=int, required=False, default=200,
+	help="How many lines are cropped from the bottom of the frame before processing.")
 args = vars(ap.parse_args())
 
 # load the known faces and embeddings along with OpenCV's Haar
@@ -82,10 +114,12 @@ else:
     src = args["source"]
 
 if args["usePiCamera"] >= 1:
-	vs = VideoStream(usePiCamera=True, rotation=args["rotateCamera"]).start()
+	vs = VideoStream(usePiCamera=True, resolution=(args["frameWidth"],args["frameHeight"]), framerate=20,rotation=args["rotateCamera"]).start()
 else:
 	vs = VideoStream(src=src).start()
 time.sleep(2.0)
+#time.sleep(0.2)
+logtime("video stream started")
 
 # variable for prev names
 prevNames = []
@@ -103,13 +137,34 @@ tolerance = float(args["tolerance"])
 # start the FPS counter
 fps = FPS().start()
 
+lastHDMICheck=time.time()
+checkHDMI()
+
 # loop over frames from the video file stream
 while True:
+
+	if HDMIStatus:
+		if time.time()-lastHDMICheck>10.0:
+			lastHDMICheck=time.time()
+			checkHDMI()
+	else:
+		while not HDMIStatus:
+			lastHDMICheck=time.time()
+			checkHDMI()
+			time.sleep(1.0)
+
+	#printjson("status", "detecting a face")
+
 	# grab the frame from the threaded video stream and resize it
 	# to 500px (to speedup processing)
+	#originalFrame = vs.read()
+	#frame = imutils.resize(originalFrame, width=500)
+	logtime("starting face detection")
 	originalFrame = vs.read()
-	frame = imutils.resize(originalFrame, width=500)
-
+	#originalFrame = originalFrame[0:0,args["frameMarginTop"]:-args["frameMarginBottom"]]
+	originalFrame = originalFrame[args["frameMarginTop"]:args["frameHeight"]-args["frameMarginBottom"],0:args["frameWidth"]]
+	frame = adjust_brightness_contrast(originalFrame, contrast=50, brightness=90)
+	
 	if args["method"] == "dnn":
 		# load the input image and convert it from BGR (OpenCV ordering)
 		# to dlib ordering (RGB)
@@ -134,10 +189,12 @@ while True:
 		# need to do a bit of reordering
 		boxes = [(y, x + w, y + h, x) for (x, y, w, h) in rects]
 
+	logtime("starting face recognition")
 	# compute the facial embeddings for each face bounding box
 	encodings = face_recognition.face_encodings(rgb, boxes)
 	names = []
 
+	logtime("got encodings")
 	# loop over the facial embeddings
 	for encoding in encodings:
 		# compute distances between this encoding and the faces in dataset
@@ -158,6 +215,7 @@ while True:
 		# update the list of names
 		names.append(name)
 
+	logtime("encodings done")
 	# loop over the recognized faces
 	for ((top, right, bottom, left), name) in zip(boxes, names):
 		# draw the predicted face name on the image
@@ -174,7 +232,8 @@ while True:
 
 	# update the FPS counter
 	fps.update()
-
+	
+	#logtime("executing login/logout")
 	logins = []
 	logouts = []
 	# Check which names are new login and which are new logout with prevNames
@@ -188,7 +247,8 @@ while True:
 				path = os.path.dirname(args["dataset"] + '/' + n + '/')
 
 				today = datetime.now()
-				cv2.imwrite(path + '/' + n + '_' + today.strftime("%Y%m%d_%H%M%S") + '.jpg', originalFrame)
+				cv2.imwrite(path + '/' + n + '_' + today.strftime("%Y%m%d_%H%M%S") + ' (org).jpg', originalFrame)
+				cv2.imwrite(path + '/' + n + '_' + today.strftime("%Y%m%d_%H%M%S") + '.jpg', frame)
 	for n in prevNames:
 		if (names.__contains__(n) == False and n is not None):
 			logouts.append(n)
@@ -207,6 +267,7 @@ while True:
 	# set this names as new prev names for next iteration
 	prevNames = names
 
+	#logtime("login/logout done")
 	key = cv2.waitKey(1) & 0xFF
 	# if the `q` key was pressed, break from the loop
 	if key == ord("q") or closeSafe == True:
